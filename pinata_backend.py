@@ -72,9 +72,12 @@ def report():
 
     with _lock:
         if not _sanity_check(realm, count):
+            print(f"[Pinata] REJECTED report: realm={realm} count={count} player={player} "
+                  f"(kept existing {_state[realm]['count']})")
             return jsonify({"error": "rejected (implausible drop)", "kept": _state[realm]["count"]}), 200
         _state[realm] = {"count": count, "updated_at": time.time(), "reporter": player}
 
+    print(f"[Pinata] Accepted report: realm={realm} count={count} player={player}")
     return jsonify({"ok": True, "realm": realm, "count": count})
 
 
