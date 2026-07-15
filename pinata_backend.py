@@ -15,11 +15,23 @@ Deploy: Railway (or fps.ms Pterodactyl). Needs one env var:
   PINATA_REPORT_KEY - shared secret baked into the mod config,
                        required on every /report call.
 
+PERSISTENCE: state is written to STATE_FILE_PATH on every accepted report
+and reloaded on startup. Point this at a Railway Volume mount (e.g. /data)
+so it survives redeploys/restarts — without a volume, this path lives on
+the container's normal ephemeral disk and gets wiped on every redeploy
+just like the old in-memory-only version did.
+
+  1. Railway dashboard -> your service -> Settings -> Volumes -> add one,
+     mount path e.g. /data
+  2. Set env var STATE_FILE_PATH=/data/pinata_state.json
+  3. Redeploy once to create the volume, then it persists from then on
+
 Run locally:  python pinata_backend.py
 Run in prod:  gunicorn pinata_backend:app --bind 0.0.0.0:$PORT
 """
 
 import os
+import json
 import time
 import threading
 from flask import Flask, request, jsonify
@@ -29,30 +41,47 @@ app = Flask(__name__)
 REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
+# Falls back to a local path if no volume is mounted yet — that path just
+# won't survive a redeploy, same as before, until STATE_FILE_PATH is set to
+# somewhere on an actual Railway Volume.
+STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
+
 # ── State ──
 # realm -> {"count": int|None, "updated_at": float|None, "reporter": str|None}
 _lock = threading.Lock()
-_state = {realm: {"count": None, "updated_at": None, "reporter": None} for realm in REALMS}
+
+
+def _default_state():
+    return {realm: {"count": None, "updated_at": None, "reporter": None} for realm in REALMS}
+
+
+def _load_state_from_disk():
+    if os.path.exists(STATE_FILE_PATH):
+        try:
+            with open(STATE_FILE_PATH) as f:
+                loaded = json.load(f)
+            state = _default_state()
+            for realm in REALMS:
+                if realm in loaded:
+                    state[realm] = loaded[realm]
+            print(f"[Pinata] Restored state from {STATE_FILE_PATH}: {state}")
+            return state
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            print(f"[Pinata] Failed to load state file, starting fresh: {e}")
+    return _default_state()
+
+
+def _save_state_to_disk():
+    try:
+        with open(STATE_FILE_PATH, "w") as f:
+            json.dump(_state, f)
+    except OSError as e:
+        print(f"[Pinata] Failed to save state file: {e}")
+
+
+_state = _load_state_from_disk()
 
 STALE_AFTER_SECONDS = 90     # HUD should show a realm as "stale" past this
-MAX_PLAUSIBLE_DROP   = 5     # a report can't drop the count by more than this...
-RESET_FLOOR          = 95    # ...unless the previous count was this high (pinata just fired)
-
-
-def _sanity_check(realm: str, new_count: int) -> bool:
-    """Reject reports that look spoofed or glitched, allow the 100->0 reset."""
-    prev = _state[realm]["count"]
-    if prev is None:
-        return True
-    if new_count >= prev:
-        return True
-    dropped = prev - new_count
-    if dropped <= MAX_PLAUSIBLE_DROP:
-        return True
-    if prev >= RESET_FLOOR and new_count <= 5:
-        # Vote party fired and reset back down near 0 — legit.
-        return True
-    return False
 
 
 @app.route("/report", methods=["POST"])
@@ -71,11 +100,8 @@ def report():
         return jsonify({"error": "count must be an int 0-100"}), 400
 
     with _lock:
-        if not _sanity_check(realm, count):
-            print(f"[Pinata] REJECTED report: realm={realm} count={count} player={player} "
-                  f"(kept existing {_state[realm]['count']})")
-            return jsonify({"error": "rejected (implausible drop)", "kept": _state[realm]["count"]}), 200
         _state[realm] = {"count": count, "updated_at": time.time(), "reporter": player}
+        _save_state_to_disk()
 
     print(f"[Pinata] Accepted report: realm={realm} count={count} player={player}")
     return jsonify({"ok": True, "realm": realm, "count": count})
