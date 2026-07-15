@@ -1,35 +1,3 @@
-"""
-pinata_backend.py
-Tiny backend for the Minecraft "Pinata Tracker" Fabric mod.
-
-Flow:
-  - Every client running the mod POSTs its current realm + vote count
-    whenever it reads a change off the scoreboard.
-  - All clients GET /counts every few seconds to render the shared
-    HUD (so a player on Elysium can also see Arcane/Cosmic progress).
-  - The Discord bot polls GET /counts on its own timer and feeds the
-    numbers into the existing send_vote_update() pipeline — this
-    service does NOT talk to Discord directly.
-
-Deploy: Railway (or fps.ms Pterodactyl). Needs one env var:
-  PINATA_REPORT_KEY - shared secret baked into the mod config,
-                       required on every /report call.
-
-PERSISTENCE: state is written to STATE_FILE_PATH on every accepted report
-and reloaded on startup. Point this at a Railway Volume mount (e.g. /data)
-so it survives redeploys/restarts — without a volume, this path lives on
-the container's normal ephemeral disk and gets wiped on every redeploy
-just like the old in-memory-only version did.
-
-  1. Railway dashboard -> your service -> Settings -> Volumes -> add one,
-     mount path e.g. /data
-  2. Set env var STATE_FILE_PATH=/data/pinata_state.json
-  3. Redeploy once to create the volume, then it persists from then on
-
-Run locally:  python pinata_backend.py
-Run in prod:  gunicorn pinata_backend:app --bind 0.0.0.0:$PORT
-"""
-
 import os
 import json
 import time
@@ -41,13 +9,8 @@ app = Flask(__name__)
 REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
-# Falls back to a local path if no volume is mounted yet — that path just
-# won't survive a redeploy, same as before, until STATE_FILE_PATH is set to
-# somewhere on an actual Railway Volume.
 STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
 
-# ── State ──
-# realm -> {"count": int|None, "updated_at": float|None, "reporter": str|None}
 _lock = threading.Lock()
 
 
@@ -81,7 +44,7 @@ def _save_state_to_disk():
 
 _state = _load_state_from_disk()
 
-STALE_AFTER_SECONDS = 90     # HUD should show a realm as "stale" past this
+STALE_AFTER_SECONDS = 120
 
 
 @app.route("/report", methods=["POST"])
