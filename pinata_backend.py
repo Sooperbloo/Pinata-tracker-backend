@@ -19,6 +19,8 @@ def _default_state():
 
 
 def _load_state_from_disk():
+    abs_path = os.path.abspath(STATE_FILE_PATH)
+    print(f"[Pinata] STATE_FILE_PATH resolves to: {abs_path}")
     if os.path.exists(STATE_FILE_PATH):
         try:
             with open(STATE_FILE_PATH) as f:
@@ -27,10 +29,12 @@ def _load_state_from_disk():
             for realm in REALMS:
                 if realm in loaded:
                     state[realm] = loaded[realm]
-            print(f"[Pinata] Restored state from {STATE_FILE_PATH}: {state}")
+            print(f"[Pinata] Restored state from {abs_path}: {state}")
             return state
         except (json.JSONDecodeError, ValueError, OSError) as e:
             print(f"[Pinata] Failed to load state file, starting fresh: {e}")
+    else:
+        print(f"[Pinata] No existing state file at {abs_path} — starting fresh")
     return _default_state()
 
 
@@ -44,7 +48,7 @@ def _save_state_to_disk():
 
 _state = _load_state_from_disk()
 
-STALE_AFTER_SECONDS = 120
+STALE_AFTER_SECONDS = 90
 
 
 @app.route("/report", methods=["POST"])
