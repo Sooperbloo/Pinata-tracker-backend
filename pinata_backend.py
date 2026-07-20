@@ -38,24 +38,29 @@ def _load_state_from_disk():
                 if realm in loaded.get("realms", loaded):
                     state[realm] = loaded.get("realms", loaded)[realm]
             maintenance = loaded.get("maintenance", False)
+            backup = loaded.get("pre_maintenance_backup")
             print(f"[Pinata] Restored state from {abs_path}: {state} maintenance={maintenance}")
-            return state, maintenance
+            return state, maintenance, backup
         except (json.JSONDecodeError, ValueError, OSError) as e:
             print(f"[Pinata] Failed to load state file, starting fresh: {e}")
     else:
         print(f"[Pinata] No existing state file at {abs_path} — starting fresh")
-    return _default_state(), False
+    return _default_state(), False, None
 
 
 def _save_state_to_disk():
     try:
         with open(STATE_FILE_PATH, "w") as f:
-            json.dump({"realms": _state, "maintenance": _maintenance}, f)
+            json.dump({
+                "realms": _state,
+                "maintenance": _maintenance,
+                "pre_maintenance_backup": _pre_maintenance_backup,
+            }, f)
     except OSError as e:
         print(f"[Pinata] Failed to save state file: {e}")
 
 
-_state, _maintenance = _load_state_from_disk()
+_state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
 
 _rate_limit_log = {}
 
@@ -147,19 +152,31 @@ def admin_maintenance():
     if request.headers.get("X-Admin-Key") != ADMIN_KEY:
         return jsonify({"error": "unauthorized"}), 401
 
-    global _maintenance
+    global _maintenance, _pre_maintenance_backup
     data = request.get_json(silent=True) or {}
     enabled = bool(data.get("enabled", True))
     reset_counts = bool(data.get("reset_counts", True))
+    restore_counts = bool(data.get("restore_counts", True))
 
     with _lock:
+        if enabled:
+            if reset_counts:
+                _pre_maintenance_backup = {realm: dict(_state[realm]) for realm in REALMS}
+                for realm in REALMS:
+                    _state[realm] = {"count": 0, "updated_at": time.time(), "reporter": "admin-maintenance"}
+                print(f"[Pinata] ADMIN: backed up pre-maintenance state: {_pre_maintenance_backup}")
+        else:
+            if restore_counts and _pre_maintenance_backup is not None:
+                for realm in REALMS:
+                    if realm in _pre_maintenance_backup:
+                        _state[realm] = _pre_maintenance_backup[realm]
+                print(f"[Pinata] ADMIN: restored pre-maintenance state: {_pre_maintenance_backup}")
+                _pre_maintenance_backup = None
+
         _maintenance = enabled
-        if enabled and reset_counts:
-            for realm in REALMS:
-                _state[realm] = {"count": 0, "updated_at": time.time(), "reporter": "admin-maintenance"}
         _save_state_to_disk()
 
-    print(f"[Pinata] ADMIN: maintenance set to {enabled} (reset_counts={reset_counts})")
+    print(f"[Pinata] ADMIN: maintenance set to {enabled} (reset_counts={reset_counts}, restore_counts={restore_counts})")
     return jsonify({"ok": True, "maintenance": _maintenance})
 
 
