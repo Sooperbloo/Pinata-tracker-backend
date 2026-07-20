@@ -16,8 +16,6 @@ DISABLED_MOD_VERSIONS = {
     v.strip() for v in os.environ.get("DISABLED_MOD_VERSIONS", "1.0.0").split(",") if v.strip()
 }
 
-SUSPICIOUS_JUMP_THRESHOLD = 15
-CONSENSUS_WINDOW_SECONDS = 10
 RATE_LIMIT_MAX_REQUESTS = 30
 RATE_LIMIT_WINDOW_SECONDS = 60
 
@@ -59,7 +57,6 @@ def _save_state_to_disk():
 
 _state, _maintenance = _load_state_from_disk()
 
-_recent_reports = {realm: {} for realm in REALMS}
 _rate_limit_log = {}
 
 STALE_AFTER_SECONDS = 90
@@ -73,12 +70,6 @@ def _check_rate_limit(client_id):
         return False
     log.append(now)
     return True
-
-
-def _prune_recent_reports(realm, now):
-    stale_ids = [cid for cid, r in _recent_reports[realm].items() if now - r["time"] > CONSENSUS_WINDOW_SECONDS]
-    for cid in stale_ids:
-        del _recent_reports[realm][cid]
 
 
 @app.route("/report", methods=["POST"])
@@ -123,30 +114,6 @@ def report():
 
     with _lock:
         now = time.time()
-        previous = _state[realm]["count"]
-        is_trusted_relay = client_id == "discord-bot-manual-relay"
-        suspicious = (previous is not None
-                      and abs(count - previous) >= SUSPICIOUS_JUMP_THRESHOLD
-                      and not is_trusted_relay)
-
-        if suspicious:
-            _prune_recent_reports(realm, now)
-
-            corroborated = any(
-                cid != client_id and abs(r["count"] - count) <= 3
-                for cid, r in _recent_reports[realm].items()
-            )
-
-            if not corroborated:
-                _recent_reports[realm][client_id] = {"count": count, "time": now}
-                print(f"[Pinata] Provisional (uncorroborated) report: realm={realm} count={count} "
-                      f"player={player} client={client_id[:8]} (previous={previous})")
-                return jsonify({"ok": True, "realm": realm, "count": count, "provisional": True})
-
-            print(f"[Pinata] Corroborated jump: realm={realm} count={count} player={player} "
-                  f"client={client_id[:8]} (previous={previous})")
-            _recent_reports[realm].pop(client_id, None)
-
         _state[realm] = {"count": count, "updated_at": now, "reporter": player}
         _save_state_to_disk()
 
