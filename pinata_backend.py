@@ -11,6 +11,15 @@ REALMS = ["Elysium", "Arcane", "Cosmic"]
 
 STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
 
+DISABLED_MOD_VERSIONS = {
+    v.strip() for v in os.environ.get("DISABLED_MOD_VERSIONS", "1.0.0").split(",") if v.strip()
+}
+
+SUSPICIOUS_JUMP_THRESHOLD = 15
+CONSENSUS_WINDOW_SECONDS = 10
+RATE_LIMIT_MAX_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+
 _lock = threading.Lock()
 
 
@@ -48,7 +57,26 @@ def _save_state_to_disk():
 
 _state = _load_state_from_disk()
 
+_recent_reports = {realm: {} for realm in REALMS}
+_rate_limit_log = {}
+
 STALE_AFTER_SECONDS = 90
+
+
+def _check_rate_limit(client_id):
+    now = time.time()
+    log = _rate_limit_log.setdefault(client_id, [])
+    log[:] = [t for t in log if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(log) >= RATE_LIMIT_MAX_REQUESTS:
+        return False
+    log.append(now)
+    return True
+
+
+def _prune_recent_reports(realm, now):
+    stale_ids = [cid for cid, r in _recent_reports[realm].items() if now - r["time"] > CONSENSUS_WINDOW_SECONDS]
+    for cid in stale_ids:
+        del _recent_reports[realm][cid]
 
 
 @app.route("/report", methods=["POST"])
@@ -57,20 +85,56 @@ def report():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
-    realm  = str(data.get("realm", ""))
-    count  = data.get("count")
-    player = str(data.get("player", "unknown"))[:32]
+    realm       = str(data.get("realm", ""))
+    count       = data.get("count")
+    player      = str(data.get("player", "unknown"))[:32]
+    client_id   = data.get("client_id")
+    mod_version = data.get("mod_version")
 
     if realm not in REALMS:
         return jsonify({"error": f"unknown realm '{realm}'"}), 400
     if not isinstance(count, int) or not (0 <= count <= 100):
         return jsonify({"error": "count must be an int 0-100"}), 400
+    if not client_id or not isinstance(client_id, str):
+        return jsonify({"error": "missing client_id — update your mod"}), 400
+    if not mod_version or not isinstance(mod_version, str):
+        return jsonify({"error": "missing mod_version — update your mod"}), 400
+    if mod_version in DISABLED_MOD_VERSIONS:
+        return jsonify({"error": f"mod version {mod_version} is disabled — please update"}), 403
+
+    if not _check_rate_limit(client_id):
+        return jsonify({"error": "rate limited"}), 429
 
     with _lock:
-        _state[realm] = {"count": count, "updated_at": time.time(), "reporter": player}
+        now = time.time()
+        previous = _state[realm]["count"]
+        is_trusted_relay = client_id == "discord-bot-manual-relay"
+        suspicious = (previous is not None
+                      and abs(count - previous) >= SUSPICIOUS_JUMP_THRESHOLD
+                      and not is_trusted_relay)
+
+        if suspicious:
+            _prune_recent_reports(realm, now)
+
+            corroborated = any(
+                cid != client_id and abs(r["count"] - count) <= 3
+                for cid, r in _recent_reports[realm].items()
+            )
+
+            if not corroborated:
+                _recent_reports[realm][client_id] = {"count": count, "time": now}
+                print(f"[Pinata] Provisional (uncorroborated) report: realm={realm} count={count} "
+                      f"player={player} client={client_id[:8]} (previous={previous})")
+                return jsonify({"ok": True, "realm": realm, "count": count, "provisional": True})
+
+            print(f"[Pinata] Corroborated jump: realm={realm} count={count} player={player} "
+                  f"client={client_id[:8]} (previous={previous})")
+            _recent_reports[realm].pop(client_id, None)
+
+        _state[realm] = {"count": count, "updated_at": now, "reporter": player}
         _save_state_to_disk()
 
-    print(f"[Pinata] Accepted report: realm={realm} count={count} player={player}")
+    print(f"[Pinata] Accepted report: realm={realm} count={count} player={player} client={client_id[:8]}")
     return jsonify({"ok": True, "realm": realm, "count": count})
 
 
