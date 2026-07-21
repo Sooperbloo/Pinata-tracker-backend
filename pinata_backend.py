@@ -118,10 +118,6 @@ def _check_rate_limit(client_id):
 @app.route("/report", methods=["POST"])
 def report():
     provided_key = request.headers.get("X-Api-Key")
-    key_owner = _identify_reporter(provided_key)
-    if key_owner is None:
-        print(f"[Pinata] REJECTED (401 unauthorized): body={request.get_json(silent=True)}")
-        return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
     realm       = str(data.get("realm", ""))
@@ -129,6 +125,25 @@ def report():
     player      = str(data.get("player", "unknown"))[:32]
     client_id   = data.get("client_id")
     mod_version = data.get("mod_version")
+
+    key_owner = _identify_reporter(provided_key)
+    if key_owner is None:
+        # Not the shared key and not a known per-player key yet. Rather than
+        # reject outright, self-register it — mirrors how client_id already
+        # works: each install generates its own random value on first launch,
+        # and its first contact with the backend is what "claims" it. No
+        # manual key distribution needed. Still requires a plausible,
+        # well-formed key (not blank) and a valid-looking request shape.
+        if provided_key and isinstance(provided_key, str) and len(provided_key) >= 16 \
+                and client_id and isinstance(client_id, str) and mod_version not in (None, ""):
+            with _lock:
+                _player_keys[provided_key] = player
+                _save_player_keys()
+            key_owner = player
+            print(f"[Pinata] Self-registered new key for player={player!r} client={str(client_id)[:8]}")
+        else:
+            print(f"[Pinata] REJECTED (401 unauthorized): body={data}")
+            return jsonify({"error": "unauthorized"}), 401
 
     print(f"[Pinata] Incoming report: key_owner={key_owner!r} realm={realm!r} count={count!r} player={player!r} "
           f"client_id={client_id!r} mod_version={mod_version!r} raw={data}")
