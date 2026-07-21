@@ -6,8 +6,8 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
-ADMIN_KEY = os.environ.get("PINATA_ADMIN_KEY", "changeme-admin")
+REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "fallback")
+ADMIN_KEY = os.environ.get("PINATA_ADMIN_KEY", "fallback-admin")
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
 STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
