@@ -115,6 +115,23 @@ def _save_report_counts():
 
 _report_counts = _load_report_counts()  # {key_owner: accepted_report_count}
 
+# Key-management unlock state — deliberately in-memory only (resets on restart,
+# safe-by-default) rather than persisted. {key: expiry_timestamp}, plus one
+# global expiry for "unlock everyone".
+_unlocked_keys = {}
+_global_unlock_until = 0
+
+
+def _resolve_key(player=None, key=None):
+    """Turns a player name or literal key into the actual key string, or None."""
+    if key:
+        return key
+    if player:
+        for k, p in _player_keys.items():
+            if p.lower() == player.lower():
+                return k
+    return None
+
 
 def _identify_reporter(provided_key):
     """Returns a display name for who this key belongs to, or None if invalid."""
@@ -360,6 +377,84 @@ def admin_leaderboard():
 
     ranked = sorted(_report_counts.items(), key=lambda item: item[1], reverse=True)
     return jsonify({"leaderboard": [{"player": p, "reports": c} for p, c in ranked]})
+
+
+@app.route("/admin/unlock", methods=["POST"])
+def admin_unlock():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    global _global_unlock_until
+    data = request.get_json(silent=True) or {}
+    scope = data.get("scope")
+    player = data.get("player")
+    key = data.get("key")
+    duration_minutes = data.get("duration_minutes", 15)
+
+    try:
+        duration_minutes = float(duration_minutes)
+    except (TypeError, ValueError):
+        duration_minutes = 15
+
+    expiry = time.time() + duration_minutes * 60
+
+    if scope == "all" or (not player and not key and not scope):
+        _global_unlock_until = expiry
+        print(f"[Pinata] ADMIN: unlocked key management for EVERYONE for {duration_minutes} min")
+        return jsonify({"ok": True, "scope": "all", "expires_in_minutes": duration_minutes})
+
+    resolved_key = _resolve_key(player=player, key=key)
+    if not resolved_key:
+        return jsonify({"error": "no matching player/key found"}), 404
+
+    _unlocked_keys[resolved_key] = expiry
+    owner = _player_keys.get(resolved_key, "(shared key)")
+    print(f"[Pinata] ADMIN: unlocked key management for {owner!r} for {duration_minutes} min")
+    return jsonify({"ok": True, "player": owner, "expires_in_minutes": duration_minutes})
+
+
+@app.route("/admin/lock", methods=["POST"])
+def admin_lock():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    global _global_unlock_until
+    data = request.get_json(silent=True) or {}
+    scope = data.get("scope")
+    player = data.get("player")
+    key = data.get("key")
+
+    if scope == "all" or (not player and not key and not scope):
+        _global_unlock_until = 0
+        _unlocked_keys.clear()
+        print("[Pinata] ADMIN: locked key management for EVERYONE")
+        return jsonify({"ok": True, "scope": "all"})
+
+    resolved_key = _resolve_key(player=player, key=key)
+    if not resolved_key:
+        return jsonify({"error": "no matching player/key found"}), 404
+
+    _unlocked_keys.pop(resolved_key, None)
+    owner = _player_keys.get(resolved_key, "(shared key)")
+    print(f"[Pinata] ADMIN: locked key management for {owner!r}")
+    return jsonify({"ok": True, "player": owner})
+
+
+@app.route("/keys/unlock_status", methods=["GET"])
+def keys_unlock_status():
+    # Public — the mod checks its OWN key's status using its own X-Api-Key,
+    # no admin auth needed since it can only ever check itself.
+    provided_key = request.headers.get("X-Api-Key")
+    now = time.time()
+
+    if now < _global_unlock_until:
+        return jsonify({"unlocked": True, "expires_in_seconds": int(_global_unlock_until - now)})
+
+    expiry = _unlocked_keys.get(provided_key)
+    if expiry and now < expiry:
+        return jsonify({"unlocked": True, "expires_in_seconds": int(expiry - now)})
+
+    return jsonify({"unlocked": False})
 
 
 @app.route("/version", methods=["GET"])
