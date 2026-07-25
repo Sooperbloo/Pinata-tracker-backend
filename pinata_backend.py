@@ -92,6 +92,29 @@ def _save_player_keys():
 
 _player_keys = _load_player_keys()  # {key: player_name}
 
+REPORT_COUNTS_PATH = os.environ.get("REPORT_COUNTS_PATH", "pinata_report_counts.json")
+
+
+def _load_report_counts():
+    if os.path.exists(REPORT_COUNTS_PATH):
+        try:
+            with open(REPORT_COUNTS_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            print(f"[Pinata] Failed to load report counts, starting empty: {e}")
+    return {}
+
+
+def _save_report_counts():
+    try:
+        with open(REPORT_COUNTS_PATH, "w") as f:
+            json.dump(_report_counts, f, indent=2)
+    except OSError as e:
+        print(f"[Pinata] Failed to save report counts: {e}")
+
+
+_report_counts = _load_report_counts()  # {key_owner: accepted_report_count}
+
 
 def _identify_reporter(provided_key):
     """Returns a display name for who this key belongs to, or None if invalid."""
@@ -175,7 +198,9 @@ def report():
     with _lock:
         now = time.time()
         _state[realm] = {"count": count, "updated_at": now, "reporter": player, "key_owner": key_owner}
+        _report_counts[key_owner] = _report_counts.get(key_owner, 0) + 1
         _save_state_to_disk()
+        _save_report_counts()
 
     print(f"[Pinata] Accepted report: key_owner={key_owner!r} realm={realm} count={count} player={player} client={client_id[:8]}")
     return jsonify({"ok": True, "realm": realm, "count": count})
@@ -305,6 +330,47 @@ def admin_revoke_key():
 
     print(f"[Pinata] ADMIN: revoked keys: {removed}")
     return jsonify({"ok": True, "revoked": [p for _, p in removed]})
+
+
+@app.route("/admin/keys/lookup", methods=["GET"])
+def admin_lookup_key():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    key = request.args.get("key")
+    player = request.args.get("player")
+
+    if key:
+        owner = _player_keys.get(key)
+        if owner is None and key == REPORT_KEY:
+            owner = "(shared key)"
+        return jsonify({"key": key, "player": owner, "found": owner is not None})
+
+    if player:
+        matches = [{"key": k, "player": p} for k, p in _player_keys.items() if p.lower() == player.lower()]
+        return jsonify({"player": player, "keys": matches, "found": len(matches) > 0})
+
+    return jsonify({"error": "provide a 'key' or 'player' query parameter"}), 400
+
+
+@app.route("/admin/leaderboard", methods=["GET"])
+def admin_leaderboard():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    ranked = sorted(_report_counts.items(), key=lambda item: item[1], reverse=True)
+    return jsonify({"leaderboard": [{"player": p, "reports": c} for p, c in ranked]})
+
+
+@app.route("/version", methods=["GET"])
+def latest_version():
+    # Public, no auth — the mod checks this on startup to show an "update
+    # available" note. Update LATEST_MOD_VERSION on Railway whenever you
+    # ship a new release, no code change/redeploy needed for this alone.
+    return jsonify({
+        "latest": os.environ.get("LATEST_MOD_VERSION", "1.0.3"),
+        "message": os.environ.get("LATEST_MOD_VERSION_MESSAGE", ""),
+    })
 
 
 @app.route("/health", methods=["GET"])
