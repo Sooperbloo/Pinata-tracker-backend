@@ -66,6 +66,12 @@ def _save_state_to_disk():
 
 _state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
 
+# Party (pinata event) status — deliberately in-memory only, not persisted.
+# This is transient event data (a party lasts minutes at most), so losing it
+# on a restart is a non-issue, unlike vote counts which need to survive.
+_party_state = {realm: {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0} for realm in REALMS}
+PARTY_STALE_AFTER_SECONDS = 60
+
 import datetime
 print(f"[Pinata] ===== BACKEND STARTED at {datetime.datetime.now(datetime.timezone.utc).isoformat()} UTC =====")
 
@@ -221,6 +227,71 @@ def report():
 
     print(f"[Pinata] Accepted report: key_owner={key_owner!r} realm={realm} count={count} player={player} client={client_id[:8]}")
     return jsonify({"ok": True, "realm": realm, "count": count})
+
+
+@app.route("/party_report", methods=["POST"])
+def party_report():
+    provided_key = request.headers.get("X-Api-Key")
+
+    data = request.get_json(silent=True) or {}
+    realm       = str(data.get("realm", ""))
+    active      = bool(data.get("active", False))
+    llama_hits  = data.get("llama_hits", [])
+    countdown   = data.get("countdown")
+    client_id   = data.get("client_id")
+    mod_version = data.get("mod_version")
+
+    if realm not in REALMS:
+        return jsonify({"error": f"unknown realm '{realm}'"}), 400
+    if not client_id or not isinstance(client_id, str):
+        return jsonify({"error": "missing client_id"}), 400
+    if not mod_version or not isinstance(mod_version, str):
+        return jsonify({"error": "missing mod_version"}), 400
+    if mod_version in DISABLED_MOD_VERSIONS:
+        return jsonify({"error": f"mod version {mod_version} is disabled — please update"}), 403
+    if not isinstance(llama_hits, list) or not all(isinstance(h, int) for h in llama_hits):
+        return jsonify({"error": "llama_hits must be a list of ints"}), 400
+    if countdown is not None and not isinstance(countdown, (int, float)):
+        return jsonify({"error": "countdown must be a number or null"}), 400
+
+    key_owner = _identify_reporter(provided_key)
+    if key_owner is None:
+        if provided_key and isinstance(provided_key, str) and len(provided_key) >= 16:
+            with _lock:
+                _player_keys[provided_key] = data.get("player", "unknown")
+                _save_player_keys()
+            key_owner = data.get("player", "unknown")
+        else:
+            return jsonify({"error": "unauthorized"}), 401
+
+    if not _check_rate_limit(client_id):
+        return jsonify({"error": "rate limited"}), 429
+
+    with _lock:
+        _party_state[realm] = {
+            "active": active,
+            "llama_hits": llama_hits,
+            "countdown": countdown,
+            "updated_at": time.time(),
+        }
+
+    print(f"[Pinata] Party report: realm={realm} active={active} llama_hits={llama_hits} "
+          f"countdown={countdown} key_owner={key_owner!r}")
+    return jsonify({"ok": True})
+
+
+@app.route("/party_status", methods=["GET"])
+def party_status():
+    now = time.time()
+    out = {}
+    for realm, entry in _party_state.items():
+        stale = (now - entry["updated_at"]) > PARTY_STALE_AFTER_SECONDS
+        out[realm] = {
+            "active": entry["active"] and not stale,
+            "llama_hits": entry["llama_hits"] if not stale else [],
+            "countdown": entry["countdown"] if not stale else None,
+        }
+    return jsonify(out)
 
 
 @app.route("/counts", methods=["GET"])
