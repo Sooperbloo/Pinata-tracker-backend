@@ -66,9 +66,7 @@ def _save_state_to_disk():
 
 _state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
 
-# Party (pinata event) status — deliberately in-memory only, not persisted.
-# This is transient event data (a party lasts minutes at most), so losing it
-# on a restart is a non-issue, unlike vote counts which need to survive.
+
 _party_state = {realm: {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0} for realm in REALMS}
 PARTY_STALE_AFTER_SECONDS = 60
 
@@ -96,7 +94,7 @@ def _save_player_keys():
         print(f"[Pinata] Failed to save player keys: {e}")
 
 
-_player_keys = _load_player_keys()  # {key: player_name}
+_player_keys = _load_player_keys()
 
 REPORT_COUNTS_PATH = os.environ.get("REPORT_COUNTS_PATH", "pinata_report_counts.json")
 
@@ -119,11 +117,9 @@ def _save_report_counts():
         print(f"[Pinata] Failed to save report counts: {e}")
 
 
-_report_counts = _load_report_counts()  # {key_owner: accepted_report_count}
+_report_counts = _load_report_counts()
 
-# Key-management unlock state — deliberately in-memory only (resets on restart,
-# safe-by-default) rather than persisted. {key: expiry_timestamp}, plus one
-# global expiry for "unlock everyone".
+
 _unlocked_keys = {}
 _global_unlock_until = 0
 
@@ -174,13 +170,9 @@ def report():
 
     key_owner = _identify_reporter(provided_key)
     if key_owner is None:
-        # Not the shared key and not a known per-player key yet. Rather than
-        # reject outright, self-register it — mirrors how client_id already
-        # works: each install generates its own random value on first launch,
-        # and its first contact with the backend is what "claims" it. No
-        # manual key distribution needed. Still requires a plausible,
-        # well-formed key (not blank) and a valid-looking request shape.
-        if provided_key and isinstance(provided_key, str) and len(provided_key) >= 16 \
+
+
+        if provided_key and isinstance(provided_key, str) and len(provided_key) >= 16\
                 and client_id and isinstance(client_id, str) and mod_version not in (None, ""):
             with _lock:
                 _player_keys[provided_key] = player
@@ -316,10 +308,8 @@ def maintenance_status():
 
 
 def _get_client_ip():
-    # Railway sits behind a proxy, so the real client IP is in X-Forwarded-For,
-    # not request.remote_addr (which would just show Railway's internal edge IP).
-    # X-Forwarded-For can be a chain "client, proxy1, proxy2" — the first entry
-    # is the original client.
+
+
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -513,8 +503,8 @@ def admin_lock():
 
 @app.route("/keys/unlock_status", methods=["GET"])
 def keys_unlock_status():
-    # Public — the mod checks its OWN key's status using its own X-Api-Key,
-    # no admin auth needed since it can only ever check itself.
+
+
     provided_key = request.headers.get("X-Api-Key")
     now = time.time()
 
@@ -528,11 +518,190 @@ def keys_unlock_status():
     return jsonify({"unlocked": False})
 
 
+ADMIN_PANEL_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinata Tracker Admin</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #101014; color: #e8e8ea;
+    margin: 0; padding: 16px 16px 60px;
+    max-width: 480px; margin-left: auto; margin-right: auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; color: #b0b3f8; margin: 28px 0 10px; border-bottom: 1px solid #2b2d31; padding-bottom: 6px; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 20px; }
+  input {
+    width: 100%; padding: 12px; margin-bottom: 8px;
+    background: #1c1c22; border: 1px solid #33333b; border-radius: 8px;
+    color: #e8e8ea; font-size: 15px;
+  }
+  button {
+    width: 100%; padding: 13px; margin-bottom: 8px;
+    background: #5865F2; border: none; border-radius: 8px;
+    color: white; font-size: 15px; font-weight: 600;
+  }
+  button:active { background: #4752c4; }
+  button.danger { background: #ED4245; }
+  button.danger:active { background: #c53537; }
+  button.secondary { background: #2b2d31; }
+  button.secondary:active { background: #35373c; }
+  .row { display: flex; gap: 8px; }
+  .row button { margin-bottom: 8px; }
+  pre {
+    background: #1c1c22; border: 1px solid #33333b; border-radius: 8px;
+    padding: 12px; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    max-height: 260px; overflow-y: auto;
+  }
+  .status { padding: 10px; border-radius: 8px; background: #1c1c22; font-size: 13px; margin-bottom: 8px; }
+  .status.on { border-left: 4px solid #ED4245; }
+  .status.off { border-left: 4px solid #57F287; }
+</style>
+</head>
+<body>
+
+<h1>Pinata Tracker Admin</h1>
+<div class="sub">Enter your admin key once — it's saved on this device only.</div>
+
+<input id="adminKey" type="password" placeholder="Admin key" autocomplete="off">
+
+<div id="statusBox" class="status">Loading status...</div>
+
+<h2>Maintenance</h2>
+<button onclick="maintenance(true)">Enable Maintenance</button>
+<button class="secondary" onclick="maintenance(false)">Disable (restore counts)</button>
+
+<h2>Key Management Unlock</h2>
+<input id="unlockTarget" placeholder="Player name (blank = everyone)">
+<input id="unlockDuration" type="number" placeholder="Minutes (default 15)" value="15">
+<div class="row">
+  <button onclick="unlock()">Unlock</button>
+  <button class="danger" onclick="lock()">Lock</button>
+</div>
+
+<h2>Keys</h2>
+<button class="secondary" onclick="listKeys()">List All Keys</button>
+<input id="lookupTarget" placeholder="Player name or key to look up">
+<button class="secondary" onclick="lookupKey()">Look Up</button>
+<input id="revokeTarget" placeholder="Player name to revoke">
+<button class="danger" onclick="revokeKey()">Revoke</button>
+
+<h2>Leaderboard</h2>
+<button class="secondary" onclick="leaderboard()">Load Leaderboard</button>
+
+<h2>Result</h2>
+<pre id="output">Results show up here.</pre>
+
+<script>
+const base = window.location.origin;
+
+function getKey() {
+  return document.getElementById('adminKey').value || localStorage.getItem('pinataAdminKey') || '';
+}
+document.getElementById('adminKey').addEventListener('input', e => {
+  localStorage.setItem('pinataAdminKey', e.target.value);
+});
+window.addEventListener('load', () => {
+  const saved = localStorage.getItem('pinataAdminKey');
+  if (saved) document.getElementById('adminKey').value = saved;
+  refreshStatus();
+});
+
+async function call(path, method, body) {
+  const out = document.getElementById('output');
+  out.textContent = 'Loading...';
+  try {
+    const opts = { method, headers: {} };
+    if (method === 'POST') {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.headers['X-Admin-Key'] = getKey();
+      opts.body = JSON.stringify(body || {});
+    } else {
+      opts.headers['X-Admin-Key'] = getKey();
+    }
+    const resp = await fetch(base + path, opts);
+    const data = await resp.json();
+    out.textContent = 'HTTP ' + resp.status + '\\n' + JSON.stringify(data, null, 2);
+    return data;
+  } catch (e) {
+    out.textContent = 'Error: ' + e;
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const m = await (await fetch(base + '/maintenance')).json();
+    const v = await (await fetch(base + '/version')).json();
+    const box = document.getElementById('statusBox');
+    box.className = 'status ' + (m.enabled ? 'on' : 'off');
+    box.textContent = 'Maintenance: ' + (m.enabled ? 'ON' : 'off') + '  |  Latest version: ' + v.latest;
+  } catch (e) {
+    document.getElementById('statusBox').textContent = 'Could not load status';
+  }
+}
+
+function maintenance(enabled) {
+  if (enabled && !confirm('Enable maintenance mode? This resets all counts to 0.')) return;
+  call('/admin/maintenance', 'POST', { enabled }).then(refreshStatus);
+}
+
+function unlock() {
+  const player = document.getElementById('unlockTarget').value.trim();
+  const duration = parseFloat(document.getElementById('unlockDuration').value) || 15;
+  const body = player ? { player, duration_minutes: duration } : { scope: 'all', duration_minutes: duration };
+  call('/admin/unlock', 'POST', body);
+}
+
+function lock() {
+  const player = document.getElementById('unlockTarget').value.trim();
+  const body = player ? { player } : { scope: 'all' };
+  call('/admin/lock', 'POST', body);
+}
+
+function listKeys() {
+  call('/admin/keys', 'GET');
+}
+
+function lookupKey() {
+  const target = document.getElementById('lookupTarget').value.trim();
+  if (!target) return;
+  const param = target.length > 20 ? 'key' : 'player';
+  const out = document.getElementById('output');
+  fetch(base + '/admin/keys/lookup?' + param + '=' + encodeURIComponent(target), {
+    headers: { 'X-Admin-Key': getKey() }
+  }).then(r => r.json()).then(d => out.textContent = JSON.stringify(d, null, 2));
+}
+
+function revokeKey() {
+  const player = document.getElementById('revokeTarget').value.trim();
+  if (!player || !confirm('Revoke key for ' + player + '?')) return;
+  call('/admin/keys/revoke', 'POST', { player });
+}
+
+function leaderboard() {
+  call('/admin/leaderboard', 'GET');
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/admin/panel", methods=["GET"])
+def admin_panel():
+
+
+    return ADMIN_PANEL_HTML, 200, {"Content-Type": "text/html"}
+
+
 @app.route("/version", methods=["GET"])
 def latest_version():
-    # Public, no auth — the mod checks this on startup to show an "update
-    # available" note. Update LATEST_MOD_VERSION on Railway whenever you
-    # ship a new release, no code change/redeploy needed for this alone.
+
+
     return jsonify({
         "latest": os.environ.get("LATEST_MOD_VERSION", "1.0.3"),
         "message": os.environ.get("LATEST_MOD_VERSION_MESSAGE", ""),
