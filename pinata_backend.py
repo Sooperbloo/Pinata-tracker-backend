@@ -645,7 +645,7 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <body>
 
 <h1>Pinata Tracker Admin</h1>
-<div class="sub">Enter your admin key once — it's saved on this device only.</div>
+<div class="sub">Admin Key</div>
 
 <input id="adminKey" type="password" placeholder="Admin key" autocomplete="off">
 
