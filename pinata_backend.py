@@ -66,6 +66,51 @@ def _save_state_to_disk():
 
 _state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
 
+COVERAGE_LOG_PATH = os.environ.get("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
+COVERAGE_SAMPLE_INTERVAL_SECONDS = 60
+COVERAGE_RETENTION_DAYS = 35
+
+
+def _load_coverage_log():
+    if os.path.exists(COVERAGE_LOG_PATH):
+        try:
+            with open(COVERAGE_LOG_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            print(f"[Pinata] Failed to load coverage log, starting empty: {e}")
+    return []
+
+
+def _save_coverage_log():
+    try:
+        with open(COVERAGE_LOG_PATH, "w") as f:
+            json.dump(_coverage_log, f)
+    except OSError as e:
+        print(f"[Pinata] Failed to save coverage log: {e}")
+
+
+_coverage_log = _load_coverage_log()
+
+
+def _coverage_sampler_loop():
+    while True:
+        time.sleep(COVERAGE_SAMPLE_INTERVAL_SECONDS)
+        now = time.time()
+        sample = {"t": now}
+        with _lock:
+            for realm in REALMS:
+                updated_at = _state[realm]["updated_at"]
+                fresh = updated_at is not None and (now - updated_at) <= STALE_AFTER_SECONDS
+                sample[realm] = fresh
+            _coverage_log.append(sample)
+            cutoff = now - COVERAGE_RETENTION_DAYS * 86400
+            while _coverage_log and _coverage_log[0]["t"] < cutoff:
+                _coverage_log.pop(0)
+            _save_coverage_log()
+
+
+threading.Thread(target=_coverage_sampler_loop, daemon=True).start()
+
 
 _party_state = {realm: {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0} for realm in REALMS}
 PARTY_STALE_AFTER_SECONDS = 60
@@ -440,6 +485,41 @@ def admin_leaderboard():
     return jsonify({"leaderboard": [{"player": p, "reports": c} for p, c in ranked]})
 
 
+@app.route("/admin/coverage", methods=["GET"])
+def admin_coverage():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        hours = float(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        return jsonify({"error": "hours must be a number"}), 400
+
+    if hours <= 0:
+        return jsonify({"error": "hours must be positive"}), 400
+
+    cutoff = time.time() - hours * 3600
+
+    with _lock:
+        relevant = [s for s in _coverage_log if s["t"] >= cutoff]
+
+    coverage = {}
+    for realm in REALMS:
+        samples = [s[realm] for s in relevant if realm in s]
+        if samples:
+            pct = 100.0 * sum(1 for v in samples if v) / len(samples)
+            coverage[realm] = round(pct, 1)
+        else:
+            coverage[realm] = None
+
+    return jsonify({
+        "period_hours": hours,
+        "samples": len(relevant),
+        "sample_interval_seconds": COVERAGE_SAMPLE_INTERVAL_SECONDS,
+        "coverage": coverage,
+    })
+
+
 @app.route("/admin/unlock", methods=["POST"])
 def admin_unlock():
     if not _admin_authorized():
@@ -593,6 +673,15 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <h2>Leaderboard</h2>
 <button class="secondary" onclick="leaderboard()">Load Leaderboard</button>
 
+<h2>Coverage (% not stale)</h2>
+<div class="row">
+  <button class="secondary" onclick="coverage(1)">Last Hour</button>
+  <button class="secondary" onclick="coverage(24)">Last Day</button>
+  <button class="secondary" onclick="coverage(168)">Last Week</button>
+</div>
+<input id="coverageHours" type="number" placeholder="Custom hours">
+<button class="secondary" onclick="coverageCustom()">Load Custom</button>
+
 <h2>Result</h2>
 <pre id="output">Results show up here.</pre>
 
@@ -684,6 +773,16 @@ function revokeKey() {
 
 function leaderboard() {
   call('/admin/leaderboard', 'GET');
+}
+
+function coverage(hours) {
+  call('/admin/coverage?hours=' + hours, 'GET');
+}
+
+function coverageCustom() {
+  const hours = parseFloat(document.getElementById('coverageHours').value);
+  if (!hours || hours <= 0) return;
+  coverage(hours);
 }
 </script>
 </body>
