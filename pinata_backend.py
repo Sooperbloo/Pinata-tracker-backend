@@ -812,6 +812,35 @@ def health():
     return jsonify({"ok": True})
 
 
+# ── Tracker image (drawn copy of the mod's display) ──
+import pinata_discord
+from pinata_image import render_pinata_image
+from flask import Response
+
+
+def _realm_snapshot():
+    """[(realm, count_or_None, stale)] in display order — what the image is drawn from."""
+    now = time.time()
+    with _lock:
+        out = []
+        for realm in REALMS:
+            entry = _state[realm]
+            updated_at = entry["updated_at"]
+            stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
+            out.append((realm, entry["count"], stale))
+    return out
+
+
+@app.route("/tracker.png", methods=["GET"])
+def tracker_png():
+    """Current tracker image — handy for checking the drawing without Discord."""
+    return Response(render_pinata_image(_realm_snapshot(), scale=4), mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+pinata_discord.start(_realm_snapshot)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
