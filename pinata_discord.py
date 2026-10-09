@@ -97,7 +97,8 @@ def _loop(get_realms):
     while True:
         time.sleep(CHECK_EVERY_SECONDS)
         try:
-            png = render_pinata_image(get_realms(), scale=IMAGE_SCALE)
+            realms, maintenance = get_realms()
+            png = render_pinata_image(realms, scale=IMAGE_SCALE, maintenance=maintenance)
             digest = hashlib.sha256(png).hexdigest()
             if digest == last_hash or time.time() - last_sent < MIN_SECONDS_BETWEEN_EDITS:
                 continue
@@ -112,7 +113,7 @@ def _loop(get_realms):
 
 def start(get_realms):
     """
-    get_realms() must return [(realm_name, count_or_None, stale_bool), ...] in display order.
+    get_realms() must return ([(realm_name, count_or_None, stale_bool), ...], maintenance_bool).
     Does nothing (and says so) if no webhook is configured.
     """
     if not WEBHOOK_URLS:
