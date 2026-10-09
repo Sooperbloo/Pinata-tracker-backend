@@ -30,6 +30,7 @@ TEXT = (255, 255, 255)
 STALE_TEXT = (150, 150, 150)
 
 GREEN, YELLOW, RED = (87, 242, 135), (254, 231, 92), (237, 66, 69)
+MAINT_RED, MAINT_GREY = (255, 85, 85), (170, 170, 170)  # maintenance screen text colours
 
 # Bar colour by count. These cut-offs are a best guess from one screenshot (77 = green, 81 = yellow).
 YELLOW_FROM = 80
@@ -62,9 +63,10 @@ def bar_colour(count):
     return GREEN
 
 
-def render_pinata_image(realms, scale=4):
+def render_pinata_image(realms, scale=4, maintenance=False):
     """
     realms: ordered list of (name, count_or_None, stale_bool)
+    maintenance: draw the 'Under Maintenance' screen instead of the counts.
     Returns PNG bytes.
     """
     img = Image.new("RGB", (NATIVE_W, NATIVE_H), BG_TOP)
@@ -79,6 +81,11 @@ def render_pinata_image(realms, scale=4):
 
     font = _load_font()
     d.text((TEXT_X, TITLE_Y), "Pinata Tracker", font=font, fill=TEXT)
+
+    if maintenance:
+        d.text((TEXT_X, 33), "Under Maintenance", font=font, fill=MAINT_RED)
+        d.text((TEXT_X, 57), "Check back soon", font=font, fill=MAINT_GREY)
+        realms = []
 
     for i, (name, count, stale) in enumerate(realms[:3]):
         ty, by = ROW_TEXT_Y[i], ROW_BAR_Y[i]
