@@ -819,7 +819,7 @@ from flask import Response
 
 
 def _realm_snapshot():
-    """[(realm, count_or_None, stale)] in display order — what the image is drawn from."""
+    """([(realm, count_or_None, stale)], maintenance) — what the image is drawn from."""
     now = time.time()
     with _lock:
         out = []
@@ -828,13 +828,14 @@ def _realm_snapshot():
             updated_at = entry["updated_at"]
             stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
             out.append((realm, entry["count"], stale))
-    return out
+    return out, _maintenance
 
 
 @app.route("/tracker.png", methods=["GET"])
 def tracker_png():
     """Current tracker image — handy for checking the drawing without Discord."""
-    return Response(render_pinata_image(_realm_snapshot(), scale=4), mimetype="image/png",
+    realms, maintenance = _realm_snapshot()
+    return Response(render_pinata_image(realms, scale=4, maintenance=maintenance), mimetype="image/png",
                     headers={"Cache-Control": "no-store"})
 
 
