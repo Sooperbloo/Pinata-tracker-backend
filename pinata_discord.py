@@ -12,6 +12,10 @@ Environment variables (set on Railway)
   PINATA_WEBHOOK_STATE_PATH   where message IDs are remembered (default pinata_webhook_messages.json).
                               Put this on a Railway volume if you want it to survive redeploys.
   PINATA_IMAGE_SCALE          image scale factor (default 4 -> 696x560).
+  PINATA_BOT_TOKEN            your Discord bot's token. Used only to LOOK AT the channel on startup, so that after an
+                              API restart the existing image message is found and edited instead of posting a second
+                              one (it also deletes older duplicates). The bot must be able to read the channel and
+                              manage messages in it. If not set, the API falls back to the saved message ID only.
 """
 import hashlib
 import json
@@ -26,6 +30,10 @@ from pinata_image import render_pinata_image
 WEBHOOK_URLS = [u.strip() for u in os.environ.get("PINATA_WEBHOOK_URLS", "").split(",") if u.strip()]
 STATE_PATH = os.environ.get("PINATA_WEBHOOK_STATE_PATH", "pinata_webhook_messages.json")
 IMAGE_SCALE = int(os.environ.get("PINATA_IMAGE_SCALE", "4"))
+BOT_TOKEN = os.environ.get("PINATA_BOT_TOKEN", "").strip()
+DISCORD_API = os.environ.get("PINATA_DISCORD_API", "https://discord.com/api/v10").rstrip("/")
+IMAGE_FILENAME = "pinata_tracker.png"
+LOOKBACK_MESSAGES = 50  # how far back to search the channel for an existing image message
 
 CHECK_EVERY_SECONDS = 3      # how often to look for a change
 MIN_SECONDS_BETWEEN_EDITS = 5  # never edit a message more often than this (Discord rate limits)
@@ -53,7 +61,7 @@ def _request(method, url, png):
         resp = requests.request(
             method, url,
             data={"payload_json": json.dumps({"attachments": []})} if method == "PATCH" else None,
-            files={"files[0]": ("pinata_tracker.png", png, "image/png")},
+            files={"files[0]": (IMAGE_FILENAME, png, "image/png")},
             timeout=20,
         )
         if resp.status_code == 429 and attempt == 0:
@@ -67,9 +75,50 @@ def _request(method, url, png):
     return resp
 
 
+def _find_existing(webhook_url):
+    """
+    Look in the webhook's channel for image messages this webhook already posted.
+    Returns the newest one's ID (and deletes older duplicates), or None if there isn't one / can't look.
+    """
+    if not BOT_TOKEN:
+        return None
+    try:
+        info = requests.get(webhook_url, timeout=15)          # webhook URL alone is enough to read its own info
+        info.raise_for_status()
+        hook = info.json()
+        webhook_id, channel_id = hook["id"], hook["channel_id"]
+        headers = {"Authorization": f"Bot {BOT_TOKEN}"}
+        resp = requests.get(f"{DISCORD_API}/channels/{channel_id}/messages",
+                            params={"limit": LOOKBACK_MESSAGES}, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"[PinataDiscord] Could not read channel to look for an existing image: "
+                  f"HTTP {resp.status_code} {resp.text[:150]}")
+            return None
+        mine = [m for m in resp.json()
+                if m.get("webhook_id") == webhook_id
+                and any(a.get("filename") == IMAGE_FILENAME for a in m.get("attachments", []))]
+        if not mine:
+            return None
+        mine.sort(key=lambda m: int(m["id"]), reverse=True)    # newest first
+        for dupe in mine[1:]:
+            requests.delete(f"{DISCORD_API}/channels/{channel_id}/messages/{dupe['id']}", headers=headers, timeout=15)
+        if len(mine) > 1:
+            print(f"[PinataDiscord] Removed {len(mine) - 1} duplicate image message(s)")
+        return mine[0]["id"]
+    except Exception as e:
+        print(f"[PinataDiscord] Existing-message lookup failed: {e}")
+        return None
+
+
 def _push(webhook_url, png, ids):
-    """Edit the remembered message, or post a fresh one if there isn't one (or it was deleted)."""
+    """Edit the existing message (remembered or found in the channel), or post a fresh one if there is none."""
     message_id = ids.get(webhook_url)
+    if not message_id:
+        message_id = _find_existing(webhook_url)
+        if message_id:
+            print("[PinataDiscord] Found the existing image message in the channel — editing it")
+            ids[webhook_url] = message_id
+            _save_ids(ids)
     if message_id:
         resp = _request("PATCH", f"{webhook_url}/messages/{message_id}", png)
         if resp.status_code == 200:
@@ -77,7 +126,15 @@ def _push(webhook_url, png, ids):
         if resp.status_code not in (404, 10008):
             print(f"[PinataDiscord] Edit failed: HTTP {resp.status_code} {resp.text[:200]}")
             return False
-        print("[PinataDiscord] Old message is gone — posting a new one")
+        print("[PinataDiscord] Old message is gone")
+        ids.pop(webhook_url, None)
+        found = _find_existing(webhook_url)
+        if found and found != message_id:
+            ids[webhook_url] = found
+            _save_ids(ids)
+            resp = _request("PATCH", f"{webhook_url}/messages/{found}", png)
+            if resp.status_code == 200:
+                return True
     resp = _request("POST", f"{webhook_url}?wait=true", png)
     if resp.status_code in (200, 204):
         try:
@@ -119,6 +176,9 @@ def start(get_realms):
     if not WEBHOOK_URLS:
         print("[PinataDiscord] PINATA_WEBHOOK_URLS not set — Discord image updates are off")
         return None
+    if not BOT_TOKEN:
+        print("[PinataDiscord] PINATA_BOT_TOKEN not set — after a restart a new image message may be posted "
+              "if the saved message ID was lost")
     t = threading.Thread(target=_loop, args=(get_realms,), daemon=True, name="pinata-discord")
     t.start()
     print(f"[PinataDiscord] Started — updating {len(WEBHOOK_URLS)} webhook message(s)")
