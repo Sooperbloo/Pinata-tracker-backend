@@ -28,7 +28,9 @@ import requests
 from pinata_image import render_pinata_image
 
 WEBHOOK_URLS = [u.strip() for u in os.environ.get("PINATA_WEBHOOK_URLS", "").split(",") if u.strip()]
-STATE_PATH = os.environ.get("PINATA_WEBHOOK_STATE_PATH", "pinata_webhook_messages.json")
+STATE_PATH = (os.environ.get("PINATA_WEBHOOK_STATE_PATH")
+              or os.path.join("/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else ".",
+                              "pinata_webhook_messages.json"))
 IMAGE_SCALE = int(os.environ.get("PINATA_IMAGE_SCALE", "4"))
 BOT_TOKEN = os.environ.get("PINATA_BOT_TOKEN", "").strip()
 DISCORD_API = os.environ.get("PINATA_DISCORD_API", "https://discord.com/api/v10").rstrip("/")
