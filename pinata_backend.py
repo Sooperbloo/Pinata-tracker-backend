@@ -6,15 +6,26 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Where saved data lives. On Railway, attach a volume mounted at /data and everything (state, coverage
+# samples, keys, report counts) is kept there so it survives restarts and redeploys. Override with DATA_DIR.
+DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else ".")
+print(f"[Pinata] Saving data in: {os.path.abspath(DATA_DIR)}"
+      + ("" if DATA_DIR != "." else "  (NOT a volume - data will be lost on redeploy!)"))
+
+
+def _data_path(env_name, filename):
+    return os.environ.get(env_name) or os.path.join(DATA_DIR, filename)
+
+
 REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
 ADMIN_KEY = os.environ.get("PINATA_ADMIN_KEY", "changeme-admin")
-KEYS_FILE_PATH = os.environ.get("KEYS_FILE_PATH", "pinata_keys.json")
+KEYS_FILE_PATH = _data_path("KEYS_FILE_PATH", "pinata_keys.json")
 ALLOWED_ADMIN_IPS = {
     ip.strip() for ip in os.environ.get("ALLOWED_ADMIN_IPS", "").split(",") if ip.strip()
 }
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
-STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
+STATE_FILE_PATH = _data_path("STATE_FILE_PATH", "pinata_state.json")
 
 DISABLED_MOD_VERSIONS = {
     v.strip() for v in os.environ.get("DISABLED_MOD_VERSIONS", "1.0.0").split(",") if v.strip()
@@ -66,7 +77,7 @@ def _save_state_to_disk():
 
 _state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
 
-COVERAGE_LOG_PATH = os.environ.get("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
+COVERAGE_LOG_PATH = _data_path("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
 COVERAGE_SAMPLE_INTERVAL_SECONDS = 60
 COVERAGE_RETENTION_DAYS = 35
 
@@ -141,7 +152,7 @@ def _save_player_keys():
 
 _player_keys = _load_player_keys()
 
-REPORT_COUNTS_PATH = os.environ.get("REPORT_COUNTS_PATH", "pinata_report_counts.json")
+REPORT_COUNTS_PATH = _data_path("REPORT_COUNTS_PATH", "pinata_report_counts.json")
 
 
 def _load_report_counts():
