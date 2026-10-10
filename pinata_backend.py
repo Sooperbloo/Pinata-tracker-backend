@@ -331,12 +331,29 @@ def party_status():
     return jsonify(out)
 
 
+# ── Test overrides (admin): show a fake count for a realm for a few seconds, without touching real data ──
+_test_overrides = {}   # realm -> {"count": int, "started": float, "expires": float}
+
+
+def _effective_state(now=None):
+    """Real state, with any active test override laid on top. Caller must hold _lock."""
+    now = now or time.time()
+    out = {realm: dict(entry) for realm, entry in _state.items()}
+    for realm in list(_test_overrides):
+        ov = _test_overrides[realm]
+        if now >= ov["expires"]:
+            del _test_overrides[realm]
+            continue
+        out[realm] = {"count": ov["count"], "updated_at": ov["started"], "reporter": "admin-test"}
+    return out
+
+
 @app.route("/counts", methods=["GET"])
 def counts():
     now = time.time()
     with _lock:
         out = {}
-        for realm, entry in _state.items():
+        for realm, entry in _effective_state(now).items():
             updated_at = entry["updated_at"]
             out[realm] = {
                 "count": entry["count"],
@@ -402,6 +419,39 @@ def admin_maintenance():
 
     print(f"[Pinata] ADMIN: maintenance set to {enabled} (reset_counts={reset_counts}, restore_counts={restore_counts})")
     return jsonify({"ok": True, "maintenance": _maintenance})
+
+
+@app.route("/admin/test_count", methods=["POST"])
+def admin_test_count():
+    """Show a fake count for one realm for a short time (to test pings / the image). Real data is untouched."""
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    realm = str(data.get("realm", ""))
+
+    if data.get("clear"):
+        with _lock:
+            _test_overrides.pop(realm, None) if realm in REALMS else _test_overrides.clear()
+        print(f"[Pinata] ADMIN: test override cleared ({realm or 'all'})")
+        return jsonify({"ok": True, "cleared": realm or "all"})
+
+    if realm not in REALMS:
+        return jsonify({"error": f"unknown realm '{realm}'"}), 400
+    count = data.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count <= 100):
+        return jsonify({"error": "count must be an int 0-100"}), 400
+    try:
+        duration = float(data.get("duration_seconds", 10))
+    except (TypeError, ValueError):
+        return jsonify({"error": "duration_seconds must be a number"}), 400
+    duration = max(1.0, min(duration, 120.0))
+
+    now = time.time()
+    with _lock:
+        _test_overrides[realm] = {"count": count, "started": now, "expires": now + duration}
+    print(f"[Pinata] ADMIN: TEST override {realm}={count} for {duration:g}s")
+    return jsonify({"ok": True, "realm": realm, "count": count, "duration_seconds": duration})
 
 
 @app.route("/admin/keys", methods=["GET"])
@@ -670,6 +720,17 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <input id="revokeTarget" placeholder="Player name to revoke">
 <button class="danger" onclick="revokeKey()">Revoke</button>
 
+<h2>Test Ping (fake count, temporary)</h2>
+<select id="testRealm" style="width:100%;padding:12px;margin-bottom:8px;background:#1c1c22;border:1px solid #33333b;border-radius:8px;color:#e8e8ea;font-size:15px;">
+  <option>Elysium</option><option>Arcane</option><option>Cosmic</option>
+</select>
+<div class="row">
+  <input id="testCount" type="number" min="0" max="100" placeholder="Count (0-100)" value="90">
+  <input id="testSeconds" type="number" min="1" max="120" placeholder="Seconds" value="10">
+</div>
+<button onclick="testCount()">Run Test</button>
+<button class="secondary" onclick="clearTest()">Cancel Test</button>
+
 <h2>Leaderboard</h2>
 <button class="secondary" onclick="leaderboard()">Load Leaderboard</button>
 
@@ -779,6 +840,18 @@ function coverage(hours) {
   call('/admin/coverage?hours=' + hours, 'GET');
 }
 
+function testCount() {
+  const realm = document.getElementById('testRealm').value;
+  const count = parseInt(document.getElementById('testCount').value, 10);
+  const duration_seconds = parseFloat(document.getElementById('testSeconds').value) || 10;
+  if (isNaN(count) || count < 0 || count > 100) return;
+  call('/admin/test_count', 'POST', { realm, count, duration_seconds });
+}
+
+function clearTest() {
+  call('/admin/test_count', 'POST', { clear: true });
+}
+
 function coverageCustom() {
   const hours = parseFloat(document.getElementById('coverageHours').value);
   if (!hours || hours <= 0) return;
@@ -822,9 +895,10 @@ def _realm_snapshot():
     """([(realm, count_or_None, stale)], maintenance) — what the image is drawn from."""
     now = time.time()
     with _lock:
+        effective = _effective_state(now)
         out = []
         for realm in REALMS:
-            entry = _state[realm]
+            entry = effective[realm]
             updated_at = entry["updated_at"]
             stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
             out.append((realm, entry["count"], stale))
