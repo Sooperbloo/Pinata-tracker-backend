@@ -903,7 +903,7 @@ from flask import Response
 
 
 def _realm_snapshot():
-    """([(realm, count_or_None, stale)], maintenance) — what the image is drawn from."""
+    """([(realm, count_or_None, stale, party_active)], maintenance) — what the image is drawn from."""
     now = time.time()
     with _lock:
         effective = _effective_state(now)
@@ -912,7 +912,9 @@ def _realm_snapshot():
             entry = effective[realm]
             updated_at = entry["updated_at"]
             stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
-            out.append((realm, entry["count"], stale))
+            party = _party_state[realm]
+            party_active = bool(party["active"]) and (now - party["updated_at"]) <= PARTY_STALE_AFTER_SECONDS
+            out.append((realm, entry["count"], stale, party_active))
     return out, _maintenance
 
 
