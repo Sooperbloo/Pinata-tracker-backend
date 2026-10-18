@@ -11,6 +11,7 @@ Everything is drawn at native size and then scaled up with nearest-neighbour, so
 Needs only Pillow. Drop a Minecraft-style .ttf next to this file as `minecraft.ttf` (or set
 PINATA_FONT_PATH) to get the in-game lettering; without it a built-in fallback font is used.
 """
+import colorsys
 import io
 import os
 
@@ -30,11 +31,12 @@ TEXT = (255, 255, 255)
 STALE_TEXT = (150, 150, 150)
 
 GREEN, YELLOW, RED = (87, 242, 135), (254, 231, 92), (237, 66, 69)
+PARTY_PINK = (255, 85, 255)  # "Piñata" text colour (matches the mod)
 MAINT_RED, MAINT_GREY = (255, 85, 85), (170, 170, 170)  # maintenance screen text colours
 
-# Bar colour by count. These cut-offs are a best guess from one screenshot (77 = green, 81 = yellow).
+# Bar colour by count: green below 80, yellow 80-89, red from 90.
 YELLOW_FROM = 80
-RED_FROM = 95
+RED_FROM = 90
 
 FONT_CANDIDATES = [
     os.environ.get("PINATA_FONT_PATH", ""),
@@ -63,9 +65,16 @@ def bar_colour(count):
     return GREEN
 
 
+def _rainbow(x, width):
+    """Full hue sweep red -> yellow -> green -> cyan -> blue -> magenta -> red, like the mod's party bar."""
+    r, g, b = colorsys.hsv_to_rgb(x / max(width - 1, 1), 1.0, 1.0)
+    return (round(r * 255), round(g * 255), round(b * 255))
+
+
 def render_pinata_image(realms, scale=4, maintenance=False):
     """
-    realms: ordered list of (name, count_or_None, stale_bool)
+    realms: ordered list of (name, count_or_None, stale_bool) or (name, count, stale, party_active_bool).
+    A realm with party_active=True shows "Name: Piñata" (pink) over a rainbow bar.
     maintenance: draw the 'Under Maintenance' screen instead of the counts.
     Returns PNG bytes.
     """
@@ -87,8 +96,22 @@ def render_pinata_image(realms, scale=4, maintenance=False):
         d.text((TEXT_X, 57), "Check back soon", font=font, fill=MAINT_GREY)
         realms = []
 
-    for i, (name, count, stale) in enumerate(realms[:3]):
+    for i, row in enumerate(realms[:3]):
+        name, count, stale = row[0], row[1], row[2]
+        party = bool(row[3]) if len(row) > 3 else False
         ty, by = ROW_TEXT_Y[i], ROW_BAR_Y[i]
+        if party:
+            prefix, msg = f"{name}: ", "Piñata"
+            pf, size = font, FONT_SIZE
+            while size > 8 and d.textlength(prefix + msg, font=pf) > BAR_W:   # shrink so it never hits the border
+                size -= 1
+                pf = _load_font(size)
+            ty_adj = ty + (FONT_SIZE - size) // 2
+            d.text((TEXT_X, ty_adj), prefix, font=pf, fill=TEXT)
+            d.text((TEXT_X + d.textlength(prefix, font=pf), ty_adj), msg, font=pf, fill=PARTY_PINK)
+            for x in range(BAR_W):
+                d.line([(BAR_X0 + x, by), (BAR_X0 + x, by + BAR_H - 1)], fill=_rainbow(x, BAR_W))
+            continue
         known = isinstance(count, int)
         label = f"{name}: {count}/100" if known else f"{name}: ?/100"
         d.text((TEXT_X, ty), label, font=font, fill=STALE_TEXT if (stale or not known) else TEXT)
