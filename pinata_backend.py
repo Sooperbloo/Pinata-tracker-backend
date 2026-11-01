@@ -934,6 +934,18 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <input id="coverageHours" type="number" placeholder="Custom hours">
 <button class="secondary" onclick="coverageCustom()">Load Custom</button>
 
+<h2>Pinata Debug</h2>
+<div class="row">
+  <button class="secondary" onclick="call('/admin/party', 'GET')">Show Party State</button>
+  <button class="secondary" onclick="call('/admin/suitecore', 'GET')">SuiteCore Status</button>
+</div>
+<div class="row">
+  <button class="secondary" onclick="clearParty(null)">Clear All</button>
+  <button class="secondary" onclick="clearParty('Elysium')">Clear Elysium</button>
+  <button class="secondary" onclick="clearParty('Arcane')">Clear Arcane</button>
+  <button class="secondary" onclick="clearParty('Cosmic')">Clear Cosmic</button>
+</div>
+
 <h2>Result</h2>
 <pre id="output">Results show up here.</pre>
 
@@ -1029,6 +1041,10 @@ function leaderboard() {
 
 function coverage(hours) {
   call('/admin/coverage?hours=' + hours, 'GET');
+}
+
+function clearParty(realm) {
+  call('/admin/party/clear', 'POST', realm ? { realm: realm } : {});
 }
 
 function coverageCustom() {
