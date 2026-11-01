@@ -130,6 +130,7 @@ SUITECORE_DRY_RUN = os.environ.get("SUITECORE_DRY_RUN", "").strip().lower() in (
 
 _suitecore_status = {"enabled": bool(SUITECORE_PARTNER_KEY), "dry_run": SUITECORE_DRY_RUN, "last_ok": None, "last_error": None, "last_applied": {}}
 _suitecore_pending = {}
+_suitecore_only = False
 
 
 def _parse_iso_epoch(value):
@@ -193,7 +194,9 @@ def _suitecore_apply(payload):
             if vmax != 100 or votes < 0 or votes > 100 or reported is None or reported > now + 60:
                 continue
             current = _state[realm]
-            if current["updated_at"] is not None and reported <= current["updated_at"]:
+            if not _suitecore_only and current["updated_at"] is not None and reported <= current["updated_at"]:
+                continue
+            if _suitecore_only and current["updated_at"] is not None and reported == current["updated_at"] and current["count"] == votes:
                 continue
             previous = current["count"]
             if previous is not None and abs(votes - previous) >= SUITECORE_JUMP_CONFIRM:
@@ -341,7 +344,18 @@ def admin_party_clear():
 def admin_suitecore():
     if not _admin_authorized():
         return jsonify({"error": "unauthorized"}), 401
-    return jsonify(_suitecore_status)
+    return jsonify({**_suitecore_status, "suitecore_only": _suitecore_only})
+
+
+@app.route("/admin/suitecore/only", methods=["POST"])
+def admin_suitecore_only():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    global _suitecore_only
+    data = request.get_json(silent=True) or {}
+    _suitecore_only = bool(data.get("enabled", True))
+    print(f"[Pinata] ADMIN: suitecore_only set to {_suitecore_only}")
+    return jsonify({"ok": True, "suitecore_only": _suitecore_only})
 
 
 
@@ -485,6 +499,9 @@ def report():
     if _maintenance:
         print(f"[Pinata] REJECTED (503): under maintenance, ignoring report from {player!r}")
         return jsonify({"error": "under maintenance"}), 503
+
+    if _suitecore_only:
+        return jsonify({"ok": True, "ignored": True})
 
     if not _check_rate_limit(client_id):
         print(f"[Pinata] REJECTED (429): rate limited client_id={client_id!r} key_owner={key_owner!r}")
@@ -938,6 +955,10 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <div class="row">
   <button class="secondary" onclick="call('/admin/party', 'GET')">Show Party State</button>
   <button class="secondary" onclick="call('/admin/suitecore', 'GET')">SuiteCore Status</button>
+</div>
+<div class="row">
+  <button class="secondary" onclick="call('/admin/suitecore/only', 'POST', { enabled: true })">SuiteCore Only: ON</button>
+  <button class="secondary" onclick="call('/admin/suitecore/only', 'POST', { enabled: false })">SuiteCore Only: OFF</button>
 </div>
 <div class="row">
   <button class="secondary" onclick="clearParty(null)">Clear All</button>
