@@ -6,26 +6,15 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Where saved data lives. On Railway, attach a volume mounted at /data and everything (state, coverage
-# samples, keys, report counts) is kept there so it survives restarts and redeploys. Override with DATA_DIR.
-DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else ".")
-print(f"[Pinata] Saving data in: {os.path.abspath(DATA_DIR)}"
-      + ("" if DATA_DIR != "." else "  (NOT a volume - data will be lost on redeploy!)"))
-
-
-def _data_path(env_name, filename):
-    return os.environ.get(env_name) or os.path.join(DATA_DIR, filename)
-
-
 REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
 ADMIN_KEY = os.environ.get("PINATA_ADMIN_KEY", "changeme-admin")
-KEYS_FILE_PATH = _data_path("KEYS_FILE_PATH", "pinata_keys.json")
+KEYS_FILE_PATH = os.environ.get("KEYS_FILE_PATH", "pinata_keys.json")
 ALLOWED_ADMIN_IPS = {
     ip.strip() for ip in os.environ.get("ALLOWED_ADMIN_IPS", "").split(",") if ip.strip()
 }
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
-STATE_FILE_PATH = _data_path("STATE_FILE_PATH", "pinata_state.json")
+STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
 
 DISABLED_MOD_VERSIONS = {
     v.strip() for v in os.environ.get("DISABLED_MOD_VERSIONS", "1.0.0").split(",") if v.strip()
@@ -76,8 +65,16 @@ def _save_state_to_disk():
 
 
 _state, _maintenance, _pre_maintenance_backup = _load_state_from_disk()
+_own_count = {
+    realm: (_state[realm].get("count") if _state[realm].get("reporter") != "suitecore" else None)
+    for realm in REALMS
+}
+_own_updated_at = {
+    realm: (_state[realm].get("updated_at") if _state[realm].get("reporter") != "suitecore" else None)
+    for realm in REALMS
+}
 
-COVERAGE_LOG_PATH = _data_path("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
+COVERAGE_LOG_PATH = os.environ.get("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
 COVERAGE_SAMPLE_INTERVAL_SECONDS = 60
 COVERAGE_RETENTION_DAYS = 35
 
@@ -113,6 +110,8 @@ def _coverage_sampler_loop():
                 updated_at = _state[realm]["updated_at"]
                 fresh = updated_at is not None and (now - updated_at) <= STALE_AFTER_SECONDS
                 sample[realm] = fresh
+                own = _own_updated_at.get(realm)
+                sample[realm + "_own"] = own is not None and (now - own) <= STALE_AFTER_SECONDS
             _coverage_log.append(sample)
             cutoff = now - COVERAGE_RETENTION_DAYS * 86400
             while _coverage_log and _coverage_log[0]["t"] < cutoff:
@@ -122,9 +121,233 @@ def _coverage_sampler_loop():
 
 threading.Thread(target=_coverage_sampler_loop, daemon=True).start()
 
+SUITECORE_PARTNER_KEY = os.environ.get("SUITECORE_PARTNER_KEY", "")
+SUITECORE_URL = os.environ.get("SUITECORE_URL", "https://suitecore.gg/api/partner/v1/vote?suite=mystic")
+SUITECORE_SUITE = "mystic"
+SUITECORE_POLL_SECONDS = max(3, int(os.environ.get("SUITECORE_POLL_SECONDS", "10")))
+SUITECORE_JUMP_CONFIRM = 40
+SUITECORE_DRY_RUN = os.environ.get("SUITECORE_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+_suitecore_status = {"enabled": bool(SUITECORE_PARTNER_KEY), "dry_run": SUITECORE_DRY_RUN, "last_ok": None, "last_error": None, "last_applied": {}}
+_suitecore_pending = {}
+
+
+def _parse_iso_epoch(value):
+    from datetime import datetime, timezone
+    if not isinstance(value, str):
+        return None
+    v = value.strip().replace("Z", "+00:00")
+    if "." in v:
+        head, rest = v.split(".", 1)
+        digits = ""
+        i = 0
+        while i < len(rest) and rest[i].isdigit():
+            digits += rest[i]
+            i += 1
+        v = head + "." + digits[:6].ljust(6, "0") + rest[i:]
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _suitecore_fetch():
+    import urllib.request
+    req = urllib.request.Request(SUITECORE_URL, headers={"X-SuiteCore-Partner-Key": SUITECORE_PARTNER_KEY, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _suitecore_apply(payload):
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unexpected response shape")
+    servers = None
+    for suite in payload.get("suites", []):
+        if isinstance(suite, dict) and suite.get("suite") == SUITECORE_SUITE and suite.get("available") is True:
+            servers = suite.get("servers")
+            break
+    if not isinstance(servers, list):
+        raise ValueError("suite not available in response")
+
+    by_realm = {r.lower(): r for r in REALMS}
+    applied = {}
+    now = time.time()
+    with _lock:
+        if _maintenance:
+            return applied
+        changed = False
+        for entry in servers:
+            if not isinstance(entry, dict):
+                continue
+            realm = by_realm.get(str(entry.get("server", "")).lower())
+            votes = entry.get("votes")
+            vmax = entry.get("max", 100)
+            reported = _parse_iso_epoch(entry.get("reportedAt"))
+            if realm is None or isinstance(votes, bool) or not isinstance(votes, int):
+                continue
+            if vmax != 100 or votes < 0 or votes > 100 or reported is None or reported > now + 60:
+                continue
+            current = _state[realm]
+            if current["updated_at"] is not None and reported <= current["updated_at"]:
+                continue
+            previous = current["count"]
+            if previous is not None and abs(votes - previous) >= SUITECORE_JUMP_CONFIRM:
+                if _suitecore_pending.get(realm) != votes:
+                    _suitecore_pending[realm] = votes
+                    print(f"[Pinata] SuiteCore: large jump {realm} {previous}->{votes}, waiting for confirmation")
+                    continue
+            _suitecore_pending.pop(realm, None)
+            if SUITECORE_DRY_RUN:
+                applied[realm] = votes
+                print(f"[Pinata] SuiteCore DRY RUN: would set {realm} {previous}->{votes}")
+                continue
+            _state[realm] = {"count": votes, "updated_at": reported, "reporter": "suitecore", "key_owner": "suitecore"}
+            applied[realm] = votes
+            changed = True
+        if changed:
+            _save_state_to_disk()
+    return applied
+
+
+def _suitecore_loop():
+    while True:
+        try:
+            applied = _suitecore_apply(_suitecore_fetch())
+            _suitecore_status["last_ok"] = time.time()
+            _suitecore_status["last_error"] = None
+            if applied:
+                _suitecore_status["last_applied"] = {**applied, "at": time.time()}
+                print(f"[Pinata] SuiteCore applied: {applied}")
+        except Exception as e:
+            _suitecore_status["last_error"] = f"{type(e).__name__}: {e}"
+            print(f"[Pinata] SuiteCore poll failed: {type(e).__name__}: {e}")
+        time.sleep(SUITECORE_POLL_SECONDS)
+
+
+if SUITECORE_PARTNER_KEY:
+    threading.Thread(target=_suitecore_loop, daemon=True).start()
+else:
+    print("[Pinata] SuiteCore sync disabled (SUITECORE_PARTNER_KEY not set)")
+
+
+def _load_partner_keys():
+    out = {}
+    for item in os.environ.get("PARTNER_KEYS", "").split(","):
+        item = item.strip()
+        if ":" not in item:
+            continue
+        name, key = item.split(":", 1)
+        name, key = name.strip(), key.strip()
+        if name and len(key) >= 24:
+            out[name] = key
+    return out
+
+
+_partner_keys = _load_partner_keys()
+
+
+def _identify_partner(provided):
+    import hmac
+    if not provided or not isinstance(provided, str):
+        return None
+    for name, key in _partner_keys.items():
+        if hmac.compare_digest(provided.encode(), key.encode()):
+            return name
+    return None
+
+
+@app.route("/partner/v1/vote", methods=["GET"])
+def partner_vote():
+    partner = _identify_partner(request.headers.get("X-Pinata-Partner-Key"))
+    if partner is None:
+        return jsonify({"error": "unauthorized"}), 401
+    if not _check_rate_limit(partner, "partner", 60):
+        return jsonify({"error": "rate limited"}), 429
+
+    from datetime import datetime, timezone
+    now = time.time()
+    servers = []
+    with _lock:
+        available = not _maintenance
+        for realm in REALMS:
+            count = _own_count.get(realm)
+            updated = _own_updated_at.get(realm)
+            if not available or count is None or updated is None:
+                continue
+            servers.append({
+                "server": realm.lower(),
+                "name": realm,
+                "votes": count,
+                "max": 100,
+                "votesNeeded": max(0, 100 - count),
+                "reportedAt": datetime.fromtimestamp(updated, timezone.utc).isoformat(),
+                "reportedSecondsAgo": int(now - updated),
+                "origin": "first_hand",
+            })
+    print(f"[Pinata] Partner pull: partner={partner!r} servers={len(servers)}")
+    return jsonify({
+        "version": 1,
+        "generatedAt": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        "suites": [{"suite": "pinatatracker", "available": available, "servers": servers}],
+    })
+
+
+@app.route("/admin/party", methods=["GET"])
+def admin_party():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    now = time.time()
+    with _lock:
+        out = {}
+        for realm, entry in _party_state.items():
+            updated = entry.get("updated_at") or 0
+            changed = entry.get("changed_at") or updated
+            out[realm] = {
+                "active": entry["active"],
+                "llama_hits": entry["llama_hits"],
+                "countdown": entry["countdown"],
+                "reporter": entry.get("reporter"),
+                "client_id": entry.get("client_id"),
+                "last_report_seconds_ago": round(now - updated, 1) if updated else None,
+                "unchanged_for_seconds": round(now - changed, 1) if updated else None,
+                "served_as_active": bool(entry["active"] and (now - updated) <= PARTY_STALE_AFTER_SECONDS
+                                         and (now - changed) <= PARTY_FROZEN_AFTER_SECONDS),
+            }
+    return jsonify(out)
+
+
+@app.route("/admin/party/clear", methods=["POST"])
+def admin_party_clear():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    realm = data.get("realm")
+    targets = REALMS if not realm else [realm]
+    if any(r not in REALMS for r in targets):
+        return jsonify({"error": "unknown realm"}), 400
+    with _lock:
+        for r in targets:
+            _party_state[r] = {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0}
+    print(f"[Pinata] ADMIN: cleared party state for {targets}")
+    return jsonify({"ok": True, "cleared": targets})
+
+
+@app.route("/admin/suitecore", methods=["GET"])
+def admin_suitecore():
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(_suitecore_status)
+
+
 
 _party_state = {realm: {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0} for realm in REALMS}
-PARTY_STALE_AFTER_SECONDS = 60
+PARTY_STALE_AFTER_SECONDS = 25
+PARTY_FROZEN_AFTER_SECONDS = 180
 
 import datetime
 print(f"[Pinata] ===== BACKEND STARTED at {datetime.datetime.now(datetime.timezone.utc).isoformat()} UTC =====")
@@ -152,7 +375,7 @@ def _save_player_keys():
 
 _player_keys = _load_player_keys()
 
-REPORT_COUNTS_PATH = _data_path("REPORT_COUNTS_PATH", "pinata_report_counts.json")
+REPORT_COUNTS_PATH = os.environ.get("REPORT_COUNTS_PATH", "pinata_report_counts.json")
 
 
 def _load_report_counts():
@@ -203,11 +426,12 @@ def _identify_reporter(provided_key):
 STALE_AFTER_SECONDS = 90
 
 
-def _check_rate_limit(client_id):
+def _check_rate_limit(client_id, bucket="report", max_requests=None):
     now = time.time()
-    log = _rate_limit_log.setdefault(client_id, [])
+    limit = max_requests or RATE_LIMIT_MAX_REQUESTS
+    log = _rate_limit_log.setdefault((bucket, client_id), [])
     log[:] = [t for t in log if now - t < RATE_LIMIT_WINDOW_SECONDS]
-    if len(log) >= RATE_LIMIT_MAX_REQUESTS:
+    if len(log) >= limit:
         return False
     log.append(now)
     return True
@@ -269,6 +493,8 @@ def report():
     with _lock:
         now = time.time()
         _state[realm] = {"count": count, "updated_at": now, "reporter": player, "key_owner": key_owner}
+        _own_updated_at[realm] = now
+        _own_count[realm] = count
         _report_counts[key_owner] = _report_counts.get(key_owner, 0) + 1
         _save_state_to_disk()
         _save_report_counts()
@@ -312,15 +538,24 @@ def party_report():
         else:
             return jsonify({"error": "unauthorized"}), 401
 
-    if not _check_rate_limit(client_id):
+    if not _check_rate_limit(client_id, "party", 120):
         return jsonify({"error": "rate limited"}), 429
 
     with _lock:
+        now_ts = time.time()
+        previous = _party_state[realm]
+        same = (previous["active"] == active
+                and previous["llama_hits"] == llama_hits
+                and previous["countdown"] == countdown)
+        changed_at = previous.get("changed_at", now_ts) if same and previous["updated_at"] else now_ts
         _party_state[realm] = {
             "active": active,
             "llama_hits": llama_hits,
             "countdown": countdown,
-            "updated_at": time.time(),
+            "updated_at": now_ts,
+            "changed_at": changed_at,
+            "reporter": data.get("player"),
+            "client_id": client_id[:8],
         }
 
     print(f"[Pinata] Party report: realm={realm} active={active} llama_hits={llama_hits} "
@@ -334,6 +569,8 @@ def party_status():
     out = {}
     for realm, entry in _party_state.items():
         stale = (now - entry["updated_at"]) > PARTY_STALE_AFTER_SECONDS
+        if entry["active"] and (now - entry.get("changed_at", now)) > PARTY_FROZEN_AFTER_SECONDS:
+            stale = True
         out[realm] = {
             "active": entry["active"] and not stale,
             "llama_hits": entry["llama_hits"] if not stale else [],
@@ -342,29 +579,12 @@ def party_status():
     return jsonify(out)
 
 
-# ── Test overrides (admin): show a fake count for a realm for a few seconds, without touching real data ──
-_test_overrides = {}   # realm -> {"count": int, "started": float, "expires": float}
-
-
-def _effective_state(now=None):
-    """Real state, with any active test override laid on top. Caller must hold _lock."""
-    now = now or time.time()
-    out = {realm: dict(entry) for realm, entry in _state.items()}
-    for realm in list(_test_overrides):
-        ov = _test_overrides[realm]
-        if now >= ov["expires"]:
-            del _test_overrides[realm]
-            continue
-        out[realm] = {"count": ov["count"], "updated_at": ov["started"], "reporter": "admin-test"}
-    return out
-
-
 @app.route("/counts", methods=["GET"])
 def counts():
     now = time.time()
     with _lock:
         out = {}
-        for realm, entry in _effective_state(now).items():
+        for realm, entry in _state.items():
             updated_at = entry["updated_at"]
             out[realm] = {
                 "count": entry["count"],
@@ -430,39 +650,6 @@ def admin_maintenance():
 
     print(f"[Pinata] ADMIN: maintenance set to {enabled} (reset_counts={reset_counts}, restore_counts={restore_counts})")
     return jsonify({"ok": True, "maintenance": _maintenance})
-
-
-@app.route("/admin/test_count", methods=["POST"])
-def admin_test_count():
-    """Show a fake count for one realm for a short time (to test pings / the image). Real data is untouched."""
-    if not _admin_authorized():
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-    realm = str(data.get("realm", ""))
-
-    if data.get("clear"):
-        with _lock:
-            _test_overrides.pop(realm, None) if realm in REALMS else _test_overrides.clear()
-        print(f"[Pinata] ADMIN: test override cleared ({realm or 'all'})")
-        return jsonify({"ok": True, "cleared": realm or "all"})
-
-    if realm not in REALMS:
-        return jsonify({"error": f"unknown realm '{realm}'"}), 400
-    count = data.get("count")
-    if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count <= 100):
-        return jsonify({"error": "count must be an int 0-100"}), 400
-    try:
-        duration = float(data.get("duration_seconds", 10))
-    except (TypeError, ValueError):
-        return jsonify({"error": "duration_seconds must be a number"}), 400
-    duration = max(1.0, min(duration, 120.0))
-
-    now = time.time()
-    with _lock:
-        _test_overrides[realm] = {"count": count, "started": now, "expires": now + duration}
-    print(f"[Pinata] ADMIN: TEST override {realm}={count} for {duration:g}s")
-    return jsonify({"ok": True, "realm": realm, "count": count, "duration_seconds": duration})
 
 
 @app.route("/admin/keys", methods=["GET"])
@@ -564,20 +751,24 @@ def admin_coverage():
     with _lock:
         relevant = [s for s in _coverage_log if s["t"] >= cutoff]
 
-    coverage = {}
+    def _pct(values):
+        if not values:
+            return None
+        return round(100.0 * sum(1 for v in values if v) / len(values), 1)
+
+    combined = {}
+    uncombined = {}
     for realm in REALMS:
-        samples = [s[realm] for s in relevant if realm in s]
-        if samples:
-            pct = 100.0 * sum(1 for v in samples if v) / len(samples)
-            coverage[realm] = round(pct, 1)
-        else:
-            coverage[realm] = None
+        combined[realm] = _pct([s[realm] for s in relevant if realm in s])
+        uncombined[realm] = _pct([s.get(realm + "_own", s[realm]) for s in relevant if realm in s])
 
     return jsonify({
         "period_hours": hours,
         "samples": len(relevant),
         "sample_interval_seconds": COVERAGE_SAMPLE_INTERVAL_SECONDS,
-        "coverage": coverage,
+        "coverage": combined,
+        "coverage_combined": combined,
+        "coverage_uncombined": uncombined,
     })
 
 
@@ -706,7 +897,7 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <body>
 
 <h1>Pinata Tracker Admin</h1>
-<div class="sub">Admin Key</div>
+<div class="sub">Enter your admin key once — it's saved on this device only.</div>
 
 <input id="adminKey" type="password" placeholder="Admin key" autocomplete="off">
 
@@ -730,17 +921,6 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <button class="secondary" onclick="lookupKey()">Look Up</button>
 <input id="revokeTarget" placeholder="Player name to revoke">
 <button class="danger" onclick="revokeKey()">Revoke</button>
-
-<h2>Test Ping (fake count, temporary)</h2>
-<select id="testRealm" style="width:100%;padding:12px;margin-bottom:8px;background:#1c1c22;border:1px solid #33333b;border-radius:8px;color:#e8e8ea;font-size:15px;">
-  <option>Elysium</option><option>Arcane</option><option>Cosmic</option>
-</select>
-<div class="row">
-  <input id="testCount" type="number" min="0" max="100" placeholder="Count (0-100)" value="90">
-  <input id="testSeconds" type="number" min="1" max="120" placeholder="Seconds" value="10">
-</div>
-<button onclick="testCount()">Run Test</button>
-<button class="secondary" onclick="clearTest()">Cancel Test</button>
 
 <h2>Leaderboard</h2>
 <button class="secondary" onclick="leaderboard()">Load Leaderboard</button>
@@ -851,18 +1031,6 @@ function coverage(hours) {
   call('/admin/coverage?hours=' + hours, 'GET');
 }
 
-function testCount() {
-  const realm = document.getElementById('testRealm').value;
-  const count = parseInt(document.getElementById('testCount').value, 10);
-  const duration_seconds = parseFloat(document.getElementById('testSeconds').value) || 10;
-  if (isNaN(count) || count < 0 || count > 100) return;
-  call('/admin/test_count', 'POST', { realm, count, duration_seconds });
-}
-
-function clearTest() {
-  call('/admin/test_count', 'POST', { clear: true });
-}
-
 function coverageCustom() {
   const hours = parseFloat(document.getElementById('coverageHours').value);
   if (!hours || hours <= 0) return;
@@ -894,39 +1062,6 @@ def latest_version():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
-
-
-# ── Tracker image (drawn copy of the mod's display) ──
-import pinata_discord
-from pinata_image import render_pinata_image
-from flask import Response
-
-
-def _realm_snapshot():
-    """([(realm, count_or_None, stale, party_active)], maintenance) — what the image is drawn from."""
-    now = time.time()
-    with _lock:
-        effective = _effective_state(now)
-        out = []
-        for realm in REALMS:
-            entry = effective[realm]
-            updated_at = entry["updated_at"]
-            stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
-            party = _party_state[realm]
-            party_active = bool(party["active"]) and (now - party["updated_at"]) <= PARTY_STALE_AFTER_SECONDS
-            out.append((realm, entry["count"], stale, party_active))
-    return out, _maintenance
-
-
-@app.route("/tracker.png", methods=["GET"])
-def tracker_png():
-    """Current tracker image — handy for checking the drawing without Discord."""
-    realms, maintenance = _realm_snapshot()
-    return Response(render_pinata_image(realms, scale=4, maintenance=maintenance), mimetype="image/png",
-                    headers={"Cache-Control": "no-store"})
-
-
-pinata_discord.start(_realm_snapshot)
 
 
 if __name__ == "__main__":
