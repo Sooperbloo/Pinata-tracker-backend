@@ -999,6 +999,17 @@ ADMIN_PANEL_HTML = """<!DOCTYPE html>
 <input id="revokeTarget" placeholder="Player name to revoke">
 <button class="danger" onclick="revokeKey()">Revoke</button>
 
+<h2>Test Ping (fake count, temporary)</h2>
+<select id="testRealm" style="width:100%;padding:12px;margin-bottom:8px;background:#1c1c22;border:1px solid #33333b;border-radius:8px;color:#e8e8ea;font-size:15px;">
+  <option>Elysium</option><option>Arcane</option><option>Cosmic</option>
+</select>
+<div class="row">
+  <input id="testCount" type="number" min="0" max="100" placeholder="Count (0-100)" value="90">
+  <input id="testSeconds" type="number" min="1" max="120" placeholder="Seconds" value="10">
+</div>
+<button onclick="testCount()">Run Test</button>
+<button class="secondary" onclick="clearTest()">Cancel Test</button>
+
 <h2>Leaderboard</h2>
 <button class="secondary" onclick="leaderboard()">Load Leaderboard</button>
 
@@ -1114,6 +1125,18 @@ function revokeKey() {
   const player = document.getElementById('revokeTarget').value.trim();
   if (!player || !confirm('Revoke key for ' + player + '?')) return;
   call('/admin/keys/revoke', 'POST', { player });
+}
+
+function testCount() {
+  const realm = document.getElementById('testRealm').value;
+  const count = parseInt(document.getElementById('testCount').value, 10);
+  const duration_seconds = parseFloat(document.getElementById('testSeconds').value) || 10;
+  if (isNaN(count) || count < 0 || count > 100) return;
+  call('/admin/test_count', 'POST', { realm, count, duration_seconds });
+}
+
+function clearTest() {
+  call('/admin/test_count', 'POST', { clear: true });
 }
 
 function leaderboard() {
