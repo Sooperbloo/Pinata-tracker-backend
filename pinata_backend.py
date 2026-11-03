@@ -6,15 +6,26 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Where saved data lives. On Railway, attach a volume mounted at /data and everything (state, coverage
+# samples, keys, report counts) is kept there so it survives restarts and redeploys. Override with DATA_DIR.
+DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else ".")
+print(f"[Pinata] Saving data in: {os.path.abspath(DATA_DIR)}"
+      + ("" if DATA_DIR != "." else "  (NOT a volume - data will be lost on redeploy!)"))
+
+
+def _data_path(env_name, filename):
+    return os.environ.get(env_name) or os.path.join(DATA_DIR, filename)
+
+
 REPORT_KEY = os.environ.get("PINATA_REPORT_KEY", "changeme")
 ADMIN_KEY = os.environ.get("PINATA_ADMIN_KEY", "changeme-admin")
-KEYS_FILE_PATH = os.environ.get("KEYS_FILE_PATH", "pinata_keys.json")
+KEYS_FILE_PATH = _data_path("KEYS_FILE_PATH", "pinata_keys.json")
 ALLOWED_ADMIN_IPS = {
     ip.strip() for ip in os.environ.get("ALLOWED_ADMIN_IPS", "").split(",") if ip.strip()
 }
 REALMS = ["Elysium", "Arcane", "Cosmic"]
 
-STATE_FILE_PATH = os.environ.get("STATE_FILE_PATH", "pinata_state.json")
+STATE_FILE_PATH = _data_path("STATE_FILE_PATH", "pinata_state.json")
 
 DISABLED_MOD_VERSIONS = {
     v.strip() for v in os.environ.get("DISABLED_MOD_VERSIONS", "1.0.0").split(",") if v.strip()
@@ -74,7 +85,7 @@ _own_updated_at = {
     for realm in REALMS
 }
 
-COVERAGE_LOG_PATH = os.environ.get("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
+COVERAGE_LOG_PATH = _data_path("COVERAGE_LOG_PATH", "pinata_coverage_log.json")
 COVERAGE_SAMPLE_INTERVAL_SECONDS = 60
 COVERAGE_RETENTION_DAYS = 35
 
@@ -389,7 +400,7 @@ def _save_player_keys():
 
 _player_keys = _load_player_keys()
 
-REPORT_COUNTS_PATH = os.environ.get("REPORT_COUNTS_PATH", "pinata_report_counts.json")
+REPORT_COUNTS_PATH = _data_path("REPORT_COUNTS_PATH", "pinata_report_counts.json")
 
 
 def _load_report_counts():
@@ -596,12 +607,28 @@ def party_status():
     return jsonify(out)
 
 
+_test_overrides = {}   # realm -> {"count": int, "started": float, "expires": float}
+
+
+def _effective_state(now=None):
+    """Real state, with any active test override laid on top. Caller must hold _lock."""
+    now = now or time.time()
+    out = {realm: dict(entry) for realm, entry in _state.items()}
+    for realm in list(_test_overrides):
+        ov = _test_overrides[realm]
+        if now >= ov["expires"]:
+            del _test_overrides[realm]
+            continue
+        out[realm] = {"count": ov["count"], "updated_at": ov["started"], "reporter": "admin-test"}
+    return out
+
+
 @app.route("/counts", methods=["GET"])
 def counts():
     now = time.time()
     with _lock:
         out = {}
-        for realm, entry in _state.items():
+        for realm, entry in _effective_state(now).items():
             updated_at = entry["updated_at"]
             out[realm] = {
                 "count": entry["count"],
@@ -667,6 +694,39 @@ def admin_maintenance():
 
     print(f"[Pinata] ADMIN: maintenance set to {enabled} (reset_counts={reset_counts}, restore_counts={restore_counts})")
     return jsonify({"ok": True, "maintenance": _maintenance})
+
+
+@app.route("/admin/test_count", methods=["POST"])
+def admin_test_count():
+    """Show a fake count for one realm for a short time (to test pings / the image). Real data is untouched."""
+    if not _admin_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    realm = str(data.get("realm", ""))
+
+    if data.get("clear"):
+        with _lock:
+            _test_overrides.pop(realm, None) if realm in REALMS else _test_overrides.clear()
+        print(f"[Pinata] ADMIN: test override cleared ({realm or 'all'})")
+        return jsonify({"ok": True, "cleared": realm or "all"})
+
+    if realm not in REALMS:
+        return jsonify({"error": f"unknown realm '{realm}'"}), 400
+    count = data.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or not (0 <= count <= 100):
+        return jsonify({"error": "count must be an int 0-100"}), 400
+    try:
+        duration = float(data.get("duration_seconds", 10))
+    except (TypeError, ValueError):
+        return jsonify({"error": "duration_seconds must be a number"}), 400
+    duration = max(1.0, min(duration, 120.0))
+
+    now = time.time()
+    with _lock:
+        _test_overrides[realm] = {"count": count, "started": now, "expires": now + duration}
+    print(f"[Pinata] ADMIN: TEST override {realm}={count} for {duration:g}s")
+    return jsonify({"ok": True, "realm": realm, "count": count, "duration_seconds": duration})
 
 
 @app.route("/admin/keys", methods=["GET"])
@@ -1099,6 +1159,38 @@ def latest_version():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
+
+
+import pinata_discord
+from pinata_image import render_pinata_image
+from flask import Response
+
+
+def _realm_snapshot():
+    now = time.time()
+    with _lock:
+        effective = _effective_state(now)
+        out = []
+        for realm in REALMS:
+            entry = effective[realm]
+            updated_at = entry["updated_at"]
+            stale = (updated_at is None) or (now - updated_at > STALE_AFTER_SECONDS)
+            party = _party_state[realm]
+            party_active = (bool(party["active"])
+                            and (now - party["updated_at"]) <= PARTY_STALE_AFTER_SECONDS
+                            and (now - party.get("changed_at", now)) <= PARTY_FROZEN_AFTER_SECONDS)
+            out.append((realm, entry["count"], stale, party_active))
+    return out, _maintenance
+
+
+@app.route("/tracker.png", methods=["GET"])
+def tracker_png():
+    realms, maintenance = _realm_snapshot()
+    return Response(render_pinata_image(realms, scale=4, maintenance=maintenance), mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+pinata_discord.start(_realm_snapshot)
 
 
 if __name__ == "__main__":
