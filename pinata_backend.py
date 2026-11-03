@@ -372,7 +372,7 @@ def admin_suitecore_only():
 
 _party_state = {realm: {"active": False, "llama_hits": [], "countdown": None, "updated_at": 0} for realm in REALMS}
 PARTY_STALE_AFTER_SECONDS = 25
-PARTY_FROZEN_AFTER_SECONDS = 180
+PARTY_FROZEN_AFTER_SECONDS = 60
 
 import datetime
 print(f"[Pinata] ===== BACKEND STARTED at {datetime.datetime.now(datetime.timezone.utc).isoformat()} UTC =====")
